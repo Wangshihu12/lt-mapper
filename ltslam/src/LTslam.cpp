@@ -76,25 +76,35 @@ LTslam::LTslam()
 LTslam::~LTslam() { }
 // dtor
 
+/**
+ * [功能描述]：LT-SLAM的主要运行函数，执行多会话SLAM的完整流程
+ * @return 无返回值
+ */
 void LTslam::run( void )
 {
-    initOptimizer();
-    initNoiseConstants();
+    // 初始化优化器和噪声常数
+    initOptimizer();        // 初始化ISAM2优化器参数
+    initNoiseConstants();   // 初始化各种噪声模型（先验、里程计、回环、大噪声等）
 
-    loadAllSessions();
-    addAllSessionsToGraph();
+    // 加载所有会话数据并构建图结构
+    loadAllSessions();      // 从指定目录加载所有会话的位姿数据
+    addAllSessionsToGraph(); // 将所有会话的节点和边添加到因子图中
 
-    optimizeMultisesseionGraph(true); // optimize the graph with existing edges 
-    writeAllSessionsTrajectories(std::string("bfr_intersession_loops"));
+    // 第一次优化：仅使用现有边进行优化
+    optimizeMultisesseionGraph(true); // 优化包含现有边的图结构
+    writeAllSessionsTrajectories(std::string("bfr_intersession_loops")); // 保存优化前的轨迹
 
-    detectInterSessionSCloops(); // detectInterSessionRSloops was internally done while sc detection 
-    addSCloops();
-    optimizeMultisesseionGraph(true); // optimize the graph with existing edges + SC loop edges
+    // 检测并添加ScanContext回环
+    detectInterSessionSCloops(); // 使用ScanContext检测会话间回环（内部同时检测RS回环）
+    addSCloops();               // 将检测到的SC回环添加到因子图中
+    optimizeMultisesseionGraph(true); // 优化包含现有边+SC回环边的图结构
 
-    bool toOpt = addRSloops(); // using the optimized estimates (rough alignment using SC)
-    optimizeMultisesseionGraph(toOpt); // optimize the graph with existing edges + SC loop edges + RS loop edges
+    // 检测并添加RS回环，使用SC优化后的估计值进行粗略对齐
+    bool toOpt = addRSloops(); // 使用优化后的估计值（通过SC粗略对齐）添加RS回环
+    optimizeMultisesseionGraph(toOpt); // 优化包含现有边+SC回环边+RS回环边的完整图结构
 
-    writeAllSessionsTrajectories(std::string("aft_intersession_loops"));
+    // 保存最终优化后的轨迹
+    writeAllSessionsTrajectories(std::string("aft_intersession_loops")); // 保存优化后的轨迹
 }
 
 void LTslam::initNoiseConstants()
@@ -622,35 +632,52 @@ void LTslam::addSessionToCentralGraph(const Session& _sess)
 }
 
 
+/**
+ * [功能描述]：加载所有会话数据，从指定目录读取会话位姿信息并构建会话对象
+ * @return 无返回值
+ */
 void LTslam::loadAllSessions() 
 {
-    // pose 
+    // 输出加载会话数据的提示信息
     ROS_INFO_STREAM("\033[1;32m Load sessions' pose dasa from: " << sessions_dir_ << "\033[0m");
+    
+    // 遍历会话目录中的所有子目录
     for(auto& _session_entry : fs::directory_iterator(sessions_dir_)) 
     {
+        // 获取当前会话目录的名称
         std::string session_name = _session_entry.path().filename();        
+        
+        // 检查是否为指定的中心会话或查询会话（目前设计为双会话版本）
         if( !isTwoStringSame(session_name, central_sess_name_) & !isTwoStringSame(session_name, query_sess_name_) ) {
-            continue; // jan. 2021. currently designed for two-session ver. (TODO: be generalized for N-session co-optimization)
+            continue; // 跳过非目标会话，目前设计为双会话版本（TODO: 扩展为N会话协同优化）
         }
 
-        // save a session (read graph txt flie and load nodes and edges internally)
+        // 确定会话索引：中心会话或源会话
         int session_idx;
         if(isTwoStringSame(session_name, central_sess_name_))
-            session_idx = target_sess_idx;
+            session_idx = target_sess_idx;  // 中心会话索引
         else
-            session_idx = source_sess_idx;
+            session_idx = source_sess_idx;  // 源会话索引
 
+        // 获取会话目录的完整路径
         std::string session_dir_path = _session_entry.path();
 
-        // sessions_.emplace_back(Session(session_idx, session_name, session_dir_path, isTwoStringSame(session_name, central_sess_name_)));
+        // 创建会话对象并插入到会话映射中
+        // 会话对象内部会读取图文件并加载节点和边信息
         sessions_.insert( std::make_pair(session_idx, 
                                          Session(session_idx, session_name, session_dir_path, isTwoStringSame(session_name, central_sess_name_))) );
 
-        // LTslam::num_sessions++; // incr the global index // TODO: make this private and provide incrSessionIdx
+        // 注释掉的代码：增加全局会话计数（TODO: 改为私有并提供incrSessionIdx方法）
+        // LTslam::num_sessions++; 
     }
 
+    // 设置布尔值输出格式
     std::cout << std::boolalpha;   
+    
+    // 输出加载的会话总数
     ROS_INFO_STREAM("\033[1;32m Total : " << sessions_.size() << " sessions are loaded.\033[0m");
+    
+    // 遍历并输出每个会话的详细信息
     std::for_each( sessions_.begin(), sessions_.end(), [](auto& _sess_pair) { 
                 cout << " — " << _sess_pair.second.name_ << " (is central: " << _sess_pair.second.is_base_session_ << ")" << endl; 
                 } );
