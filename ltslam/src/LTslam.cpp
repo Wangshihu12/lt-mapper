@@ -311,34 +311,64 @@ std::optional<gtsam::Pose3> LTslam::doICPGlobalRelative( // For RS loop
 } // doICPGlobalRelative
 
 
+/**
+ * [功能描述]：使用 ScanContext 方法检测会话间的闭环（Inter-Session Loop Closure Detection）
+ * 
+ * 该函数通过比较源会话（source session）和目标会话（target session）中的 ScanContext 描述子，
+ * 检测两个会话之间的相似位置，从而识别闭环候选对。检测结果分为两类：
+ * - SCLoopIdxPairs_: 成功匹配的闭环索引对
+ * - RSLoopIdxPairs_: 未找到匹配但需要后续通过最近邻姿态查找的索引对
+ * 
+ * @note 使用类成员变量：
+ *       - target_sess_idx: 目标会话的索引
+ *       - source_sess_idx: 源会话的索引
+ *       - SCLoopIdxPairs_: 存储检测到的闭环索引对（目标会话索引，源会话索引）
+ *       - RSLoopIdxPairs_: 存储需要后续处理的索引对（标记为 -1 的目标索引，源会话索引）
+ * @return 无返回值（void），结果存储在成员变量 SCLoopIdxPairs_ 和 RSLoopIdxPairs_ 中
+ */
 void LTslam::detectInterSessionSCloops() // using ScanContext
 {
+    // 获取目标会话和源会话的引用
     auto& target_sess = sessions_.at(target_sess_idx); 
     auto& source_sess = sessions_.at(source_sess_idx);
 
-    // Detect loop closures: Find loop edge index pairs 
-    SCLoopIdxPairs_.clear();
-    RSLoopIdxPairs_.clear();
+    // 清空之前的闭环检测结果，准备存储新的闭环索引对
+    SCLoopIdxPairs_.clear(); // 存储成功匹配的 ScanContext 闭环索引对
+    RSLoopIdxPairs_.clear(); // 存储需要后续通过最近邻姿态查找的索引对
+    
+    // 获取目标会话和源会话的 ScanContext 管理器引用
     auto& target_scManager = target_sess.scManager;
     auto& source_scManager = source_sess.scManager;
+    
+    // 遍历源会话中的所有节点（关键帧），逐个与目标会话进行闭环检测
     for (int source_node_idx=0; source_node_idx < int(source_scManager.polarcontexts_.size()); source_node_idx++)
     {
-        std::vector<float> source_node_key = source_scManager.polarcontext_invkeys_mat_.at(source_node_idx);
-        Eigen::MatrixXd source_node_scd = source_scManager.polarcontexts_.at(source_node_idx);
+        // 获取源会话当前节点的 ScanContext 描述符
+        std::vector<float> source_node_key = source_scManager.polarcontext_invkeys_mat_.at(source_node_idx); // 极坐标上下文的紧凑特征向量（键值）
+        Eigen::MatrixXd source_node_scd = source_scManager.polarcontexts_.at(source_node_idx); // 完整的极坐标上下文矩阵描述子
 
-        auto detectResult = target_scManager.detectLoopClosureIDBetweenSession(source_node_key, source_node_scd); // first: nn index, second: yaw diff 
+        // 在目标会话中检测与当前源节点最相似的节点
+        // detectResult.first: 最近邻节点索引（-1 表示未找到匹配）
+        // detectResult.second: 偏航角差异（yaw diff）
+        auto detectResult = target_scManager.detectLoopClosureIDBetweenSession(source_node_key, source_node_scd);
 
+        // 记录源会话和目标会话中的闭环节点索引
         int loop_idx_source_session = source_node_idx;
         int loop_idx_target_session = detectResult.first;
 
-        if(loop_idx_target_session == -1) { // TODO using NO_LOOP_FOUND rather using -1 
-            RSLoopIdxPairs_.emplace_back(std::pair(-1, loop_idx_source_session)); // -1 will be later be found (nn pose). 
-            continue;
+        // 如果在目标会话中未找到匹配的闭环节点
+        if(loop_idx_target_session == -1) { // TODO: 建议使用 NO_LOOP_FOUND 常量替代 -1 
+            // 将该索引对标记为需要后续处理（通过最近邻姿态查找）
+            RSLoopIdxPairs_.emplace_back(std::pair(-1, loop_idx_source_session)); // -1 表示目标索引待定，将在后续通过最近邻姿态查找确定
+            continue; // 跳过当前节点，继续处理下一个源节点
         }
 
+        // 成功找到闭环匹配，将索引对添加到 ScanContext 闭环列表中
+        // pair 的 first 是目标会话索引，second 是源会话索引
         SCLoopIdxPairs_.emplace_back(std::pair(loop_idx_target_session, loop_idx_source_session));
     }
 
+    // 输出检测到的会话间闭环总数（绿色高亮显示）
     ROS_INFO_STREAM("\033[1;32m Total " << SCLoopIdxPairs_.size() << " inter-session loops are found. \033[0m");
 } // detectInterSessionSCloops
 
@@ -377,50 +407,88 @@ std::vector<std::pair<int, int>> LTslam::equisampleElements(
     return sc_loop_idx_pairs_sampled;
 }
 
+/**
+ * [功能描述]：将 ScanContext 检测到的闭环约束添加到 GTSAM 优化图中
+ * 
+ * 该函数处理之前通过 detectInterSessionSCloops() 检测到的会话间闭环。主要流程包括：
+ * 1. 对检测到的闭环进行等间隔采样，避免闭环数量过多影响性能
+ * 2. 对采样后的闭环对进行 ICP 配准，验证并计算精确的相对位姿
+ * 3. 将配准成功的闭环约束添加到 GTSAM 因子图中进行全局优化
+ * 
+ * @note 使用类成员变量：
+ *       - SCLoopIdxPairs_: 待处理的 ScanContext 闭环索引对
+ *       - target_sess_idx: 目标会话索引
+ *       - source_sess_idx: 源会话索引
+ *       - gtSAMgraph: GTSAM 因子图
+ *       - kNumSCLoopsUpperBound: 闭环数量上限
+ *       - numberOfCores: 用于并行计算的 CPU 核心数
+ *       - mtx: 互斥锁，用于保护共享资源
+ * @return 无返回值（void），闭环约束直接添加到 gtSAMgraph 中
+ */
 void LTslam::addSCloops()
 {
+    // 如果没有检测到任何 ScanContext 闭环，直接返回
     if(SCLoopIdxPairs_.empty()) 
         return;
 
-    // equi-sampling sc loops 
+    // ========== 步骤 1: 对闭环进行等间隔采样 ==========
+    // 获取检测到的所有闭环数量
     int num_scloops_all_found = int(SCLoopIdxPairs_.size());
+    // 计算实际要添加的闭环数量（不超过设定的上限）
     int num_scloops_to_be_added = std::min( num_scloops_all_found, kNumSCLoopsUpperBound );
+    // 计算等间隔采样的间隔大小
     int equisampling_gap = num_scloops_all_found / num_scloops_to_be_added;
 
+    // 执行等间隔采样，从所有闭环中均匀选取指定数量的闭环
     auto sc_loop_idx_pairs_sampled = equisampleElements(SCLoopIdxPairs_, equisampling_gap, num_scloops_to_be_added);
     auto num_scloops_sampled = sc_loop_idx_pairs_sampled.size();
 
-    // add selected sc loops 
+    // ========== 步骤 2: 准备添加选中的闭环 ==========
+    // 获取目标会话和源会话的引用
     auto& target_sess = sessions_.at(target_sess_idx); 
     auto& source_sess = sessions_.at(source_sess_idx);
 
+    // 用于记录已成功添加的闭环索引（调试用）
     std::vector<int> idx_added_loops; 
     idx_added_loops.reserve(num_scloops_sampled);
-    #pragma omp parallel for num_threads(numberOfCores)
+    
+    // ========== 步骤 3: 并行处理每个采样的闭环对 ==========
+    #pragma omp parallel for num_threads(numberOfCores) // 使用 OpenMP 并行加速处理
     for (int ith = 0; ith < num_scloops_sampled; ith++) 
     {
+        // 获取当前闭环索引对
         auto& _loop_idx_pair = sc_loop_idx_pairs_sampled.at(ith);
-        int loop_idx_target_session = _loop_idx_pair.first;
-        int loop_idx_source_session = _loop_idx_pair.second;
+        int loop_idx_target_session = _loop_idx_pair.first;  // 目标会话中的节点索引
+        int loop_idx_source_session = _loop_idx_pair.second; // 源会话中的节点索引
 
+        // 执行 ICP（Iterative Closest Point）配准，计算两个节点之间的精确相对位姿
+        // 返回值是 optional 类型，配准失败时为空
         auto relative_pose_optional = doICPVirtualRelative(target_sess, source_sess, loop_idx_target_session, loop_idx_source_session); 
 
+        // 如果 ICP 配准成功，将闭环约束添加到 GTSAM 图中
         if(relative_pose_optional) {
-            mtx.lock();
-            gtsam::Pose3 relative_pose = relative_pose_optional.value();
+            mtx.lock(); // 加锁保护共享资源 gtSAMgraph
+            gtsam::Pose3 relative_pose = relative_pose_optional.value(); // 提取相对位姿
+            
+            // 向 GTSAM 因子图添加带锚点的 Between 因子（闭环约束）
+            // 该因子连接目标会话和源会话中的对应节点，并考虑各自的锚点节点
             gtSAMgraph.add( BetweenFactorWithAnchoring<gtsam::Pose3>(
-                genGlobalNodeIdx(target_sess_idx, loop_idx_target_session), genGlobalNodeIdx(source_sess_idx, loop_idx_source_session),
-                genAnchorNodeIdx(target_sess_idx), genAnchorNodeIdx(source_sess_idx), 
-                relative_pose, robustNoise) );
-            mtx.unlock();
+                genGlobalNodeIdx(target_sess_idx, loop_idx_target_session), // 目标节点的全局索引
+                genGlobalNodeIdx(source_sess_idx, loop_idx_source_session), // 源节点的全局索引
+                genAnchorNodeIdx(target_sess_idx), // 目标会话的锚点节点索引
+                genAnchorNodeIdx(source_sess_idx), // 源会话的锚点节点索引
+                relative_pose,  // 相对位姿约束
+                robustNoise) ); // 鲁棒噪声模型，降低外点影响
+            mtx.unlock(); // 解锁
 
-            // debug msg (would be removed later)
-            mtx.lock();
-            idx_added_loops.emplace_back(loop_idx_target_session); 
+            // ========== 调试信息输出（后续可能移除） ==========
+            mtx.lock(); // 加锁保护共享资源 idx_added_loops 和 cout
+            idx_added_loops.emplace_back(loop_idx_target_session); // 记录已添加的闭环
+            // 输出闭环边的详细信息：连接的两个节点和对应的锚点节点
             cout << "SCdetector found an inter-session edge between " 
                 << genGlobalNodeIdx(target_sess_idx, loop_idx_target_session) << " and " << genGlobalNodeIdx(source_sess_idx, loop_idx_source_session) 
                 << " (anchor nodes are " << genAnchorNodeIdx(target_sess_idx) << " and " << genAnchorNodeIdx(source_sess_idx) << ")" << endl;
-            mtx.unlock();
+            mtx.unlock(); // 解锁
         }
     }
 } // addSCloops
@@ -515,60 +583,106 @@ void LTslam::findNearestRSLoopsTargetNodeIdx() // based-on information gain
 }
 
 
+/**
+ * [功能描述]：添加 Revisit/Random Sampling (RS) 闭环约束到 GTSAM 优化图中
+ * 
+ * RS 闭环是对 ScanContext 闭环的补充机制，用于处理那些未被 ScanContext 检测到的潜在闭环。
+ * 该函数针对之前 ScanContext 检测失败（标记为 -1）的节点，通过最近邻搜索找到目标会话中
+ * 距离最近的节点，然后进行 ICP 全局配准验证。主要流程包括：
+ * 1. 检查是否启用 RS 闭环功能
+ * 2. 为每个未匹配的源节点查找目标会话中最近的节点
+ * 3. 对闭环候选进行等间隔采样
+ * 4. 执行 ICP 全局配准并添加验证通过的闭环约束
+ * 
+ * @note 使用类成员变量：
+ *       - RSLoopIdxPairs_: RS 闭环索引对（由 detectInterSessionSCloops 生成）
+ *       - kNumRSLoopsUpperBound: RS 闭环数量上限，为 0 时禁用 RS 闭环
+ *       - target_sess_idx: 目标会话索引
+ *       - source_sess_idx: 源会话索引
+ *       - gtSAMgraph: GTSAM 因子图
+ *       - numberOfCores: 并行计算的 CPU 核心数
+ *       - mtx: 互斥锁
+ * @return 是否成功添加了 RS 闭环（true: 已添加，false: 未添加或未启用）
+ */
 bool LTslam::addRSloops()
 {
+    // ========== 步骤 1: 检查 RS 闭环功能是否启用 ==========
+    // 如果 RS 闭环数量上限为 0，说明禁用了该功能
     if( kNumRSLoopsUpperBound == 0 )
         return false;
 
-    // find nearest target node idx 
+    // ========== 步骤 2: 查找最近的目标节点索引 ==========
+    // 对于 RSLoopIdxPairs_ 中目标索引为 -1 的节点对，通过最近邻搜索
+    // 在目标会话中找到距离最近的节点，更新目标索引
     findNearestRSLoopsTargetNodeIdx();
 
-    // parse RS loop src idx
+    // ========== 步骤 3: 解析和验证 RS 闭环候选 ==========
+    // 获取所有找到的 RS 闭环候选数量
     int num_rsloops_all_found = int(RSLoopIdxPairs_.size());
+    // 如果没有找到任何 RS 闭环候选，返回 false
     if( num_rsloops_all_found == 0 )
         return false;
 
+    // ========== 步骤 4: 对闭环候选进行等间隔采样 ==========
+    // 计算实际要添加的 RS 闭环数量（不超过设定的上限）
     int num_rsloops_to_be_added = std::min( num_rsloops_all_found, kNumRSLoopsUpperBound );
+    // 计算等间隔采样的间隔大小
     int equisampling_gap = num_rsloops_all_found / num_rsloops_to_be_added;
 
+    // 执行等间隔采样，从所有候选中均匀选取指定数量的闭环
     auto rs_loop_idx_pairs_sampled = equisampleElements(RSLoopIdxPairs_, equisampling_gap, num_rsloops_to_be_added);
     auto num_rsloops_sampled = rs_loop_idx_pairs_sampled.size();
 
-    cout << "num of RS pair: " << num_rsloops_all_found << endl;         
-    cout << "num of sampled RS pair: " << num_rsloops_sampled << endl;         
+    // 输出 RS 闭环候选的统计信息
+    cout << "num of RS pair: " << num_rsloops_all_found << endl;         // 总共找到的 RS 闭环对数量
+    cout << "num of sampled RS pair: " << num_rsloops_sampled << endl;   // 采样后要处理的 RS 闭环对数量
 
-    // add selected rs loops 
+    // ========== 步骤 5: 准备添加选中的 RS 闭环 ==========
+    // 获取目标会话和源会话的引用
     auto& target_sess = sessions_.at(target_sess_idx); 
     auto& source_sess = sessions_.at(source_sess_idx);
 
-    #pragma omp parallel for num_threads(numberOfCores)
+    // ========== 步骤 6: 并行处理每个采样的 RS 闭环对 ==========
+    #pragma omp parallel for num_threads(numberOfCores) // 使用 OpenMP 并行加速处理
     for (int ith = 0; ith < num_rsloops_sampled; ith++) 
     {
+        // 获取当前闭环索引对
         auto& _loop_idx_pair = rs_loop_idx_pairs_sampled.at(ith);
-        int loop_idx_target_session = _loop_idx_pair.first;
-        int loop_idx_source_session = _loop_idx_pair.second;
+        int loop_idx_target_session = _loop_idx_pair.first;  // 目标会话中的节点索引（已通过最近邻更新）
+        int loop_idx_source_session = _loop_idx_pair.second; // 源会话中的节点索引
 
+        // 执行 ICP 全局配准，计算两个节点之间的精确相对位姿
+        // 注意：这里使用 doICPGlobalRelative（全局配准），而非 doICPVirtualRelative（虚拟配准）
+        // 返回值是 optional 类型，配准失败时为空
         auto relative_pose_optional = doICPGlobalRelative(target_sess, source_sess, loop_idx_target_session, loop_idx_source_session); 
 
+        // 如果 ICP 配准成功，将 RS 闭环约束添加到 GTSAM 图中
         if(relative_pose_optional) {
-            mtx.lock();
-            gtsam::Pose3 relative_pose = relative_pose_optional.value();
+            mtx.lock(); // 加锁保护共享资源 gtSAMgraph
+            gtsam::Pose3 relative_pose = relative_pose_optional.value(); // 提取相对位姿
+            
+            // 向 GTSAM 因子图添加带锚点的 Between 因子（RS 闭环约束）
+            // 该因子连接目标会话和源会话中的对应节点，并考虑各自的锚点节点
             gtSAMgraph.add( BetweenFactorWithAnchoring<gtsam::Pose3>(
-                genGlobalNodeIdx(target_sess_idx, loop_idx_target_session), genGlobalNodeIdx(source_sess_idx, loop_idx_source_session),
-                genAnchorNodeIdx(target_sess_idx), genAnchorNodeIdx(source_sess_idx), 
-                relative_pose, robustNoise) );
-            mtx.unlock();
+                genGlobalNodeIdx(target_sess_idx, loop_idx_target_session), // 目标节点的全局索引
+                genGlobalNodeIdx(source_sess_idx, loop_idx_source_session), // 源节点的全局索引
+                genAnchorNodeIdx(target_sess_idx), // 目标会话的锚点节点索引
+                genAnchorNodeIdx(source_sess_idx), // 源会话的锚点节点索引
+                relative_pose,  // 相对位姿约束
+                robustNoise) ); // 鲁棒噪声模型，降低外点影响
+            mtx.unlock(); // 解锁
 
-            // debug msg (would be removed later)
-            mtx.lock();
+            // ========== 调试信息输出（后续可能移除） ==========
+            mtx.lock(); // 加锁保护共享资源 cout
+            // 输出 RS 闭环边的详细信息：连接的两个节点和对应的锚点节点
             cout << "RS loop detector found an inter-session edge between " 
                 << genGlobalNodeIdx(target_sess_idx, loop_idx_target_session) << " and " << genGlobalNodeIdx(source_sess_idx, loop_idx_source_session) 
                 << " (anchor nodes are " << genAnchorNodeIdx(target_sess_idx) << " and " << genAnchorNodeIdx(source_sess_idx) << ")" << endl;
-            mtx.unlock();
+            mtx.unlock(); // 解锁
         }
     }
 
-    return true;
+    return true; // 成功处理 RS 闭环
 } // addRSloops
 
 
